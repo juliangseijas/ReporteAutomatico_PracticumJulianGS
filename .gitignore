@@ -1,0 +1,16 @@
+# Created by venv; see https://docs.python.org/3/library/venv.html
+
+# Python virtual environment
+venv/
+__pycache__/
+*.py[cod]
+
+# Local secrets and credentials
+.env
+.env.*
+credentials.json
+token.json
+
+# OS/editor noise
+.DS_Store
+*.log
