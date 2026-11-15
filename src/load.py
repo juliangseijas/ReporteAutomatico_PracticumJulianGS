@@ -1,74 +1,166 @@
-import os.path
+import os
+from google.auth.exceptions import RefreshError
 from google.auth.transport.requests import Request
 from google.oauth2.credentials import Credentials
 from google_auth_oauthlib.flow import InstalledAppFlow
 from googleapiclient.discovery import build
 
-# Este es el alcance o permiso: Le decimos a Google que queremos modificar presentaciones
-SCOPES = ['https://www.googleapis.com/auth/presentations']
+try:
+    from src.config import Config
+    from src.transform import (
+        construir_marcadores_reporte,
+        extraer_marcadores_imagen_validos,
+    )
+except ImportError:
+    from config import Config
+    from transform import (
+        construir_marcadores_reporte,
+        extraer_marcadores_imagen_validos,
+    )
 
-# ID de la plantilla de Google Slides
-PRESENTATION_ID = '1G2-phuROq_Crjazr-x7XH6ZphOmN9eMXQnH6i8EJBFc'
+SCOPES = Config.GOOGLE_SCOPES
+PRESENTATION_ID = Config.DEFAULT_PRESENTATION_ID
 
 
-def autenticar_google():
-    print("Protocolo de seguridad OAuth 2.0 con Google...")
+def obtener_credenciales_google():
+    """
+    Obtiene o refresca las credenciales OAuth 2.0 de Google para Slides y Drive.
+    """
     creds = None
+    token_path = Config.TOKEN_FILE if os.path.exists(Config.TOKEN_FILE) else "token.json"
+    creds_path = (
+        Config.CREDENTIALS_FILE
+        if os.path.exists(Config.CREDENTIALS_FILE)
+        else "credentials.json"
+    )
 
-    if os.path.exists('token.json'):
-        creds = Credentials.from_authorized_user_file('token.json', SCOPES)
+    if os.path.exists(token_path):
+        creds = Credentials.from_authorized_user_file(token_path, SCOPES)
 
     if not creds or not creds.valid:
         if creds and creds.expired and creds.refresh_token:
-            creds.refresh(Request())
+            try:
+                creds.refresh(Request())
+            except RefreshError:
+                creds = None
         else:
-            flow = InstalledAppFlow.from_client_secrets_file('credentials.json', SCOPES)
+            creds = None
+
+        if creds is None:
+            flow = InstalledAppFlow.from_client_secrets_file(creds_path, SCOPES)
             creds = flow.run_local_server(port=0)
 
-        with open('token.json', 'w') as token:
+        with open(Config.TOKEN_FILE, "w", encoding="utf-8") as token:
             token.write(creds.to_json())
 
-    return build('slides', 'v1', credentials=creds)
+    return creds
+
+
+def autenticar_google():
+    """Retorna el cliente autenticado de Google Slides API v1."""
+    print("Protocolo de seguridad OAuth 2.0 con Google...")
+    creds = obtener_credenciales_google()
+    return build("slides", "v1", credentials=creds)
+
+
+def copiar_plantilla(presentation_id, nombre_reporte, creds=None):
+    """
+    Clona la presentación plantilla en Google Drive y retorna dict con id, name y webViewLink.
+    """
+    creds = creds or obtener_credenciales_google()
+    servicio_drive = build("drive", "v3", credentials=creds)
+    copia = (
+        servicio_drive.files()
+        .copy(
+            fileId=presentation_id,
+            body={"name": nombre_reporte},
+            fields="id,name,webViewLink",
+        )
+        .execute()
+    )
+    return copia
+
+
+def renderizar_slide(
+    presentation_id,
+    datos_campana,
+    nombre_reporte,
+    inyectar_imagenes=True,
+):
+    """
+    Clona la plantilla de Google Slides, inyecta imágenes en las formas que contengan
+    marcadores de imagen (ej. {{f_top1_url}}, {{i_top1_url}}, {{i_mapa_calor}}) y
+    reemplaza todos los marcadores de texto {{...}}.
+    """
+    creds = obtener_credenciales_google()
+    servicio_slides = build("slides", "v1", credentials=creds)
+    copia = copiar_plantilla(presentation_id, nombre_reporte, creds=creds)
+
+    marcadores = construir_marcadores_reporte(datos_campana)
+
+    # 1. Inyección de imágenes mediante replaceAllShapesWithImage (si aplica)
+    if inyectar_imagenes:
+        marcadores_img = extraer_marcadores_imagen_validos(marcadores)
+        for marcador_img, url_img in marcadores_img.items():
+            try:
+                servicio_slides.presentations().batchUpdate(
+                    presentationId=copia["id"],
+                    body={
+                        "requests": [
+                            {
+                                "replaceAllShapesWithImage": {
+                                    "imageUrl": url_img,
+                                    "imageReplaceMethod": "CENTER_INSIDE",
+                                    "containsText": {
+                                        "text": marcador_img,
+                                        "matchCase": True,
+                                    },
+                                }
+                            }
+                        ]
+                    },
+                ).execute()
+            except Exception as e:
+                print(
+                    f"Aviso: No se pudo inyectar imagen para {marcador_img} ({e}). "
+                    "Se reemplazará como texto."
+                )
+
+    # 2. Reemplazo masivo de todos los marcadores de texto restantes
+    peticiones_texto = [
+        {
+            "replaceAllText": {
+                "containsText": {"text": marcador, "matchCase": True},
+                "replaceText": str(valor),
+            }
+        }
+        for marcador, valor in marcadores.items()
+    ]
+
+    if peticiones_texto:
+        servicio_slides.presentations().batchUpdate(
+            presentationId=copia["id"],
+            body={"requests": peticiones_texto},
+        ).execute()
+
+    return copia
 
 
 def probar_inyeccion_slides():
-    servicio = autenticar_google()
-    print("Conexión establecida. Escribiendo en la plantilla...")
-
-    peticiones = [
-        {'replaceAllText': {'containsText': {'text': '{{facebook_campana}}', 'matchCase': True}, 'replaceText': 'Universal en Becas - Facebook'}},
-        {'replaceAllText': {'containsText': {'text': '{{facebook_impresiones}}', 'matchCase': True}, 'replaceText': '154820'}},
-        {'replaceAllText': {'containsText': {'text': '{{facebook_alcance}}', 'matchCase': True}, 'replaceText': '98250'}},
-        {'replaceAllText': {'containsText': {'text': '{{facebook_clics}}', 'matchCase': True}, 'replaceText': '5760'}},
-        {'replaceAllText': {'containsText': {'text': '{{facebook_ctr}}', 'matchCase': True}, 'replaceText': '3.72%'}},
-        {'replaceAllText': {'containsText': {'text': '{{facebook_gasto}}', 'matchCase': True}, 'replaceText': '$3,961.17'}},
-        {'replaceAllText': {'containsText': {'text': '{{instagram_campana}}', 'matchCase': True}, 'replaceText': 'Universal en Becas - Instagram'}},
-        {'replaceAllText': {'containsText': {'text': '{{instagram_impresiones}}', 'matchCase': True}, 'replaceText': '193410'}},
-        {'replaceAllText': {'containsText': {'text': '{{instagram_alcance}}', 'matchCase': True}, 'replaceText': '128900'}},
-        {'replaceAllText': {'containsText': {'text': '{{instagram_clics}}', 'matchCase': True}, 'replaceText': '6214'}},
-        {'replaceAllText': {'containsText': {'text': '{{instagram_ctr}}', 'matchCase': True}, 'replaceText': '3.21%'}},
-        {'replaceAllText': {'containsText': {'text': '{{instagram_gasto}}', 'matchCase': True}, 'replaceText': '$2,845.93'}},
-        {'replaceAllText': {'containsText': {'text': '{{google_campana}}', 'matchCase': True}, 'replaceText': 'Universal en Becas - Google Ads'}},
-        {'replaceAllText': {'containsText': {'text': '{{google_impresiones}}', 'matchCase': True}, 'replaceText': '321560'}},
-        {'replaceAllText': {'containsText': {'text': '{{google_clics}}', 'matchCase': True}, 'replaceText': '12800'}},
-        {'replaceAllText': {'containsText': {'text': '{{google_ctr}}', 'matchCase': True}, 'replaceText': '3.98%'}},
-        {'replaceAllText': {'containsText': {'text': '{{google_costo}}', 'matchCase': True}, 'replaceText': '$4,120.40'}},
-        {'replaceAllText': {'containsText': {'text': '{{google_cpc}}', 'matchCase': True}, 'replaceText': '$0.32'}},
-        {'replaceAllText': {'containsText': {'text': '{{google_conversiones}}', 'matchCase': True}, 'replaceText': '241'}},
-    ]
-
-    cuerpo = {'requests': peticiones}
-
     try:
-        respuesta = servicio.presentations().batchUpdate(
-            presentationId=PRESENTATION_ID, body=cuerpo).execute()
+        from src.extract import generar_datos_demo_completos
+    except ImportError:
+        from extract import generar_datos_demo_completos
 
-        reemplazos = len(respuesta.get('replies', []))
-        print(f" Se modificó la presentación en vivo.")
+    datos_demo = generar_datos_demo_completos("Universal en Becas")
+    copia = renderizar_slide(
+        PRESENTATION_ID,
+        datos_demo,
+        "PRUEBA Inyección Google Slides - Universal en Becas",
+    )
+    print(f"Se creó y actualizó la copia en vivo: {copia.get('webViewLink', copia['id'])}")
+    return copia
 
-    except Exception as e:
-        print(f"Ocurrió un error al contactar a Google: {e}")
 
-
-if __name__ == '__main__':
+if __name__ == "__main__":
     probar_inyeccion_slides()
